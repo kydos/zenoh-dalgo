@@ -7,6 +7,6 @@ use zenoh_dalgo::group::ZGroup;
 async fn main() {
     env_logger::init();
     let z = Arc::new(open(ConfigProperties::default()).await.unwrap());
-    let group = ZGroup::join("demo-group".to_string(), Duration::from_secs(10), z).await;
+    let group = ZGroup::join("demo-group".to_string(), Duration::from_secs(5), z).await;
     async_std::task::sleep(Duration::from_secs(60)).await;
 }

@@ -5,6 +5,7 @@ use futures::prelude::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ops::Div;
 use std::time::Duration;
 use zenoh::net::protocol::core::PeerId;
 use zenoh::net::queryable::EVAL;
@@ -12,6 +13,7 @@ use zenoh::net::{Query, QueryConsolidation, QueryTarget, Queryable, Sample, Sess
 
 const ZGROUP_PREFIX: &str = "/zenoh/net/utils/group";
 const MAX_START_LOOKOUT_DELAY: usize = 2;
+const VIEW_REFRESH_LEASE_RATIO: f32 = 0.75f32;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ZGroupView {
@@ -168,6 +170,40 @@ async fn query_handler(
     }
 }
 
+async fn refresh_view(
+    z: Arc<Session>,
+    query: String,
+    self_id: String,
+    lease: Duration,
+    tx: Arc<Sender<ZGroupEvent>>,
+    leader: Arc<Mutex<String>>,
+) {
+    // @TODO: Deal with termination
+    loop {
+        let sleep_time = lease.mul_f32(VIEW_REFRESH_LEASE_RATIO);
+        log::debug!("Sleeping for: {:?} secs", sleep_time);
+        async_std::task::sleep(sleep_time).await;
+        let l = leader.lock().await;
+        if *l == self_id {
+            let mut reply = z
+                .query(
+                    &query.clone().into(),
+                    &self_id,
+                    QueryTarget::default(),
+                    QueryConsolidation::default(),
+                )
+                .await;
+            let mut members = HashSet::new();
+            if let Ok(mut new_view) = reply {
+                while let Some(m) = new_view.next().await {
+                    members.insert(String::from_utf8(m.data.payload.get_vec()).unwrap());
+                }
+            }
+            tx.send(ZGroupEvent::UpdatedGroupView { members });
+            // @TODO: Distributed New View
+        }
+    }
+}
 impl ZGroup {
     pub async fn join(gid: String, lease: Duration, z: Arc<zenoh::net::Session>) -> ZGroup {
         let mid = z.id().await;
@@ -229,7 +265,7 @@ impl ZGroup {
         log::debug!("Issuing Query: {}", &query);
         let mut initial_view = z
             .query(
-                &query.into(),
+                &query.clone().into(),
                 &mid,
                 QueryTarget::default(),
                 QueryConsolidation::default(),
@@ -247,6 +283,15 @@ impl ZGroup {
 
         // Now we start the task tha refreshes the view if we are the member with the
         // smallest group-id
+        let rv = refresh_view(
+            z.clone(),
+            query.clone(),
+            mid.clone(),
+            lease,
+            Arc::new(evt_tx.clone()),
+            leader.clone(),
+        );
+        async_std::task::spawn(rv);
         zg
     }
 
