@@ -1,11 +1,12 @@
 use async_std::sync::{Arc, Condvar, Mutex};
 use flume::{Receiver, Sender};
 use futures::prelude::*;
+use futures::select;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 use zenoh::net::queryable::EVAL;
-use zenoh::net::{QueryConsolidation,  ConsolidationMode, QueryTarget, Sample, Session};
+use zenoh::net::{ConsolidationMode, QueryConsolidation, QueryTarget, Sample, Session, SubInfo};
 use zenoh::ZFuture;
 
 const ZGROUP_PREFIX: &str = "/zenoh/net/utils/group";
@@ -23,10 +24,19 @@ struct ZGroupView {
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ZGroupEvent {
-    Join { mid: String },
-    Leave { mid: String },
-    NewLeader { mid: String },
-    UpdatedGroupView { members: HashSet<String> },
+    Join {
+        mid: String,
+    },
+    Leave {
+        mid: String,
+    },
+    NewLeader {
+        mid: String,
+    },
+    UpdatedGroupView {
+        source: String,
+        members: HashSet<String>,
+    },
 }
 
 pub struct ZGroupConfig {
@@ -47,7 +57,7 @@ impl ZGroupConfig {
             lease: DEFAULT_LEASE,
             view_refresh_lease_ratio: VIEW_REFRESH_LEASE_RATIO,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
-            z
+            z,
         }
     }
     pub fn member_id<'a>(&'a mut self, id: String) -> &'a mut Self {
@@ -55,7 +65,7 @@ impl ZGroupConfig {
         self
     }
 
-    pub fn lease<'a>(&'a mut self, d: Duration<>) -> &'a mut Self {
+    pub fn lease<'a>(&'a mut self, d: Duration) -> &'a mut Self {
         self.lease = d;
         self
     }
@@ -65,7 +75,6 @@ impl ZGroupConfig {
         self
     }
 }
-
 
 pub struct ZGroup {
     gid: String,
@@ -104,7 +113,9 @@ async fn local_event_loop(
                         Some(tx) => {
                             tx.send(ZGroupEvent::Join { mid: mid.clone() }).unwrap();
                             if new_leader {
-                                let _ = tx.send(ZGroupEvent::NewLeader { mid: mid.clone() }).unwrap();
+                                let _ = tx
+                                    .send(ZGroupEvent::NewLeader { mid: mid.clone() })
+                                    .unwrap();
                             }
                             view_changed.notify_all();
                         }
@@ -138,9 +149,10 @@ async fn local_event_loop(
                     }
                 }
             }
-            ZGroupEvent::UpdatedGroupView { members } => {
+            ZGroupEvent::UpdatedGroupView { source, members } => {
                 log::debug!(
-                    "ZGroupEvent::UpdatedGroupView ( members:  {})",
+                    "ZGroupEvent::UpdatedGroupView ( source: {}\n, members:  {})",
+                    source,
                     members
                         .iter()
                         .fold(String::from("\n"), |a, b| format!("\t{} \n\t{}", a, b))
@@ -153,12 +165,14 @@ async fn local_event_loop(
                         for l in left {
                             tx.send(ZGroupEvent::Leave {
                                 mid: String::from(l),
-                            }).unwrap();
+                            })
+                            .unwrap();
                         }
                         for j in joined {
                             tx.send(ZGroupEvent::Join {
                                 mid: String::from(j),
-                            }).unwrap();
+                            })
+                            .unwrap();
                         }
                     }
                     None => {}
@@ -197,7 +211,8 @@ async fn query_handler(
         if query.predicate != self_id {
             tx.send(ZGroupEvent::Join {
                 mid: query.predicate.clone(),
-            }).unwrap();
+            })
+            .unwrap();
         }
         query.reply(Sample {
             res_name: q_res.clone().into(),
@@ -206,11 +221,41 @@ async fn query_handler(
         })
     }
 }
+async fn zenoh_event_handler(
+    z: Arc<Session>,
+    evt_res_id: u64,
+    lease: Duration,
+    leader: Arc<Mutex<String>>,
+    tx: Arc<Sender<ZGroupEvent>>,
+) {
+    let mut sub = z
+        .declare_subscriber(&evt_res_id.into(), &SubInfo::default())
+        .await
+        .unwrap();
+    let timeout = async_std::task::sleep(lease);
 
+    loop {
+        select!(
+            evt = sub.receiver().next().fuse() =>  {
+               let sample = evt.unwrap();
+                let gvu = bincode::deserialize::<ZGroupView>(&sample.payload.to_vec()).unwrap();
+                log::debug!("Received view update zenoh event");
+                let ge = ZGroupEvent::UpdatedGroupView { source : gvu.leader, members: gvu.members };
+                tx.send(ge);
+            },
+            _ = async_std::task::sleep(lease).fuse() => {
+                log::debug!("Timed-out on view update zenoh event, declaring leader failed");
+                let l = String::from(&*leader.lock().await);
+                tx.send(ZGroupEvent::Leave { mid: l });
+            }
+        )
+    }
+}
 async fn refresh_view(
     z: Arc<Session>,
     query: String,
     self_id: String,
+    evt_res_id: u64,
     lease: Duration,
     tx: Arc<Sender<ZGroupEvent>>,
     leader: Arc<Mutex<String>>,
@@ -228,13 +273,12 @@ async fn refresh_view(
         let l = String::from(&*leader.lock().await);
 
         if l == self_id {
+            log::debug!(
+                "This member ({}) is not the leader, going back to sleep",
+                &self_id
+            );
             let reply = z
-                .query(
-                    &query.clone().into(),
-                    &self_id,
-                    QueryTarget::default(),
-                    qc,
-                )
+                .query(&query.clone().into(), &self_id, QueryTarget::default(), qc)
                 .await;
             let mut members = HashSet::new();
             if let Ok(mut new_view) = reply {
@@ -242,8 +286,13 @@ async fn refresh_view(
                     members.insert(String::from_utf8(m.data.payload.get_vec()).unwrap());
                 }
             }
-            tx.send(ZGroupEvent::UpdatedGroupView { members }).unwrap();
-            // @TODO: Distributed New View
+            let uge = ZGroupEvent::UpdatedGroupView {
+                source: self_id.clone(),
+                members,
+            };
+            let buf = bincode::serialize(&uge).unwrap();
+            tx.send(uge).unwrap();
+            z.write(&evt_res_id.into(), buf.into());
         }
     }
 }
@@ -253,8 +302,12 @@ impl ZGroup {
         let members = Arc::new(Mutex::new(HashSet::new()));
         let qrbl_res = format!("/{}/{}/member/{}", ZGROUP_PREFIX, &config.gid, &config.mid);
         let query = format!("/{}/{}/member/*", ZGROUP_PREFIX, &config.gid);
-        let evt_sub_res = format!("/{}/{}/event", ZGROUP_PREFIX, &config.gid);
-
+        let evt_res = format!("/{}/{}/event", ZGROUP_PREFIX, &config.gid);
+        let evt_res_id = config
+            .z
+            .declare_resource(&evt_res.clone().into())
+            .await
+            .unwrap();
         let view_changed = Arc::new(Condvar::new());
 
         let (evt_tx, evt_rx) = flume::unbounded::<ZGroupEvent>();
@@ -308,7 +361,8 @@ impl ZGroup {
             last_router: ConsolidationMode::None,
             reception: ConsolidationMode::None,
         };
-        let mut initial_view = config.z
+        let mut initial_view = config
+            .z
             .query(
                 &query.clone().into(),
                 &config.mid,
@@ -324,7 +378,12 @@ impl ZGroup {
             let omid = String::from_utf8(bs).unwrap();
             members.insert(omid);
         }
-        evt_tx.send(ZGroupEvent::UpdatedGroupView { members }).unwrap();
+        evt_tx
+            .send(ZGroupEvent::UpdatedGroupView {
+                source: config.mid.clone(),
+                members,
+            })
+            .unwrap();
 
         // Now we start the task tha refreshes the view if we are the member with the
         // smallest group-id
@@ -332,11 +391,20 @@ impl ZGroup {
             config.z.clone(),
             query.clone(),
             config.mid.clone(),
+            evt_res_id,
             config.lease,
             Arc::new(evt_tx.clone()),
             leader.clone(),
         );
         async_std::task::spawn(rv);
+        let zeh = zenoh_event_handler(
+            config.z.clone(),
+            evt_res_id,
+            config.lease,
+            leader.clone(),
+            Arc::new(evt_tx.clone()),
+        );
+        async_std::task::spawn(zeh);
         zg
     }
 
