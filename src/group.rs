@@ -1,3 +1,4 @@
+use crate::group::ZGroupEvent::UpdatedGroupView;
 use async_std::sync::{Arc, Condvar, Mutex};
 use flume::{Receiver, Sender};
 use futures::prelude::*;
@@ -14,13 +15,6 @@ const MAX_START_LOOKOUT_DELAY: usize = 2;
 const VIEW_REFRESH_LEASE_RATIO: f32 = 0.75f32;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_LEASE: Duration = Duration::from_secs(18);
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ZGroupView {
-    leader: String,
-    gid: String,
-    members: HashSet<String>,
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ZGroupEvent {
@@ -238,10 +232,16 @@ async fn zenoh_event_handler(
         select!(
             evt = sub.receiver().next().fuse() =>  {
                let sample = evt.unwrap();
-                let gvu = bincode::deserialize::<ZGroupView>(&sample.payload.to_vec()).unwrap();
-                log::debug!("Received view update zenoh event");
-                let ge = ZGroupEvent::UpdatedGroupView { source : gvu.leader, members: gvu.members };
-                tx.send(ge).unwrap();
+                match bincode::deserialize::<ZGroupEvent>(&sample.payload.to_vec()) {
+                    Ok(ge) => {
+                        log::debug!("Received zenoh group event");
+                        tx.send(ge).unwrap();
+                    },
+                    Err(e) => {
+                        log::error!("Failed to unmarshal data: {}", e);
+                    }
+                }
+
             },
             _ = async_std::task::sleep(lease).fuse() => {
                 log::debug!("Timed-out on view update zenoh event, declaring leader failed");
