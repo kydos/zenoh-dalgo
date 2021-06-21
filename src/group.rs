@@ -241,12 +241,12 @@ async fn zenoh_event_handler(
                 let gvu = bincode::deserialize::<ZGroupView>(&sample.payload.to_vec()).unwrap();
                 log::debug!("Received view update zenoh event");
                 let ge = ZGroupEvent::UpdatedGroupView { source : gvu.leader, members: gvu.members };
-                tx.send(ge);
+                tx.send(ge).unwrap();
             },
             _ = async_std::task::sleep(lease).fuse() => {
                 log::debug!("Timed-out on view update zenoh event, declaring leader failed");
                 let l = String::from(&*leader.lock().await);
-                tx.send(ZGroupEvent::Leave { mid: l });
+                tx.send(ZGroupEvent::Leave { mid: l }).unwrap();
             }
         )
     }
