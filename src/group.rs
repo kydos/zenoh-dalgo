@@ -17,7 +17,7 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_LEASE: Duration = Duration::from_secs(18);
 
 #[derive(Serialize, Deserialize, Debug)]
-enum ZGroupEvent {
+pub enum ZGroupEvent {
     Join {
         mid: String,
     },
@@ -78,7 +78,6 @@ pub struct ZGroup {
     view_changed: Arc<Condvar>,
     lease: Duration,
     z: Arc<zenoh::net::Session>,
-    group_events_rx: Arc<Mutex<Option<Receiver<ZGroupEvent>>>>,
     group_events_tx: Arc<Mutex<Option<Sender<ZGroupEvent>>>>,
 }
 
@@ -96,20 +95,21 @@ async fn local_event_loop(
             ZGroupEvent::Join { mid } => {
                 log::debug!("ZGroupEvent::Join ( mid: {} )", &mid);
                 if ms.insert(mid.clone()) == true {
-                    let u_evt = user_evt_tx.lock().await;
-                    let mut l = leader.lock().await;
+                    let mut lg = leader.lock().await;
                     let mut new_leader = false;
-                    if *l > mid {
-                        *l = mid.clone();
+                    if *lg > mid {
+                        *lg = mid.clone();
                         new_leader = true;
                     }
+                    drop(lg);
+                    let mut u_evt = user_evt_tx.lock().await;
                     match &*u_evt {
                         Some(tx) => {
-                            tx.send(ZGroupEvent::Join { mid: mid.clone() }).unwrap();
-                            if new_leader {
-                                let _ = tx
-                                    .send(ZGroupEvent::NewLeader { mid: mid.clone() })
-                                    .unwrap();
+                            if let Err(_) = tx.send(ZGroupEvent::Join { mid: mid.clone() }) {
+                                *u_evt = None;
+                            } else if new_leader {
+                                // Worse case we'll clean-up on next event
+                                let _ = tx.send(ZGroupEvent::NewLeader { mid: mid.clone() });
                             }
                             view_changed.notify_all();
                         }
@@ -123,18 +123,22 @@ async fn local_event_loop(
                     return;
                 } else {
                     if ms.remove(&mid) == true {
-                        let u_evt = user_evt_tx.lock().await;
-                        let mut l = leader.lock().await;
+                        let mut lg = leader.lock().await;
                         let mut new_leader = false;
-                        if *l == mid {
-                            *l = ms.iter().min().unwrap().into();
+                        if *lg == mid {
+                            *lg = ms.iter().min().unwrap().into();
                             new_leader = true;
                         }
+                        let l = (*lg).clone();
+                        drop(lg);
+                        let mut u_evt = user_evt_tx.lock().await;
                         match &*u_evt {
                             Some(tx) => {
-                                tx.send(ZGroupEvent::Leave { mid }).unwrap();
-                                if new_leader {
-                                    tx.send(ZGroupEvent::NewLeader { mid: l.clone() }).unwrap();
+                                if let Err(_) = tx.send(ZGroupEvent::Leave { mid }) {
+                                    *u_evt = None;
+                                } else if new_leader {
+                                    // Worse case we'll clean-up on next event
+                                    let _ = tx.send(ZGroupEvent::NewLeader { mid: l });
                                 }
                             }
                             None => {}
@@ -157,16 +161,18 @@ async fn local_event_loop(
                 match &*u_evt {
                     Some(tx) => {
                         for l in left {
-                            tx.send(ZGroupEvent::Leave {
+                            if let Err(_) = tx.send(ZGroupEvent::Leave {
                                 mid: String::from(l),
-                            })
-                            .unwrap();
+                            }) {
+                                break;
+                            }
                         }
                         for j in joined {
-                            tx.send(ZGroupEvent::Join {
+                            if let Err(_) = tx.send(ZGroupEvent::Join {
                                 mid: String::from(j),
-                            })
-                            .unwrap();
+                            }) {
+                                break;
+                            }
                         }
                     }
                     None => {}
@@ -176,12 +182,12 @@ async fn local_event_loop(
                 let mut l = leader.lock().await;
                 if *l != min {
                     *l = min.clone();
-                }
-                match &*u_evt {
-                    Some(tx) => {
-                        tx.send(ZGroupEvent::NewLeader { mid: min.into() }).unwrap();
+                    match &*u_evt {
+                        Some(tx) => {
+                            let _ = tx.send(ZGroupEvent::NewLeader { mid: min.into() });
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 view_changed.notify_all();
             }
@@ -323,7 +329,6 @@ impl ZGroup {
             lease: config.lease,
             view_changed: view_changed.clone(),
             z: config.z.clone(),
-            group_events_rx: ge_rx,
             group_events_tx: ge_tx.clone(),
         };
 
@@ -435,6 +440,15 @@ impl ZGroup {
                 ms = self.view_changed.wait(ms).await;
             }
         }
+    }
+
+    /// Returns a receivers that will allow to receive notifications for group events.
+    /// Notice that there can be a single subscription at the time, each call to subscribe
+    /// will cancel the previous subscription.
+    pub async fn subscribe(&self) -> Receiver<ZGroupEvent> {
+        let (tx, rx) = flume::unbounded();
+        *self.group_events_tx.lock().await = Some(tx);
+        rx
     }
 }
 
