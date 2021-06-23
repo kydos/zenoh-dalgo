@@ -436,13 +436,22 @@ impl ZGroup {
         ms.len()
     }
 
-    pub async fn await_view_size(&self, n: usize, _timeout: Duration) {
+    pub async fn await_view_size(&self, n: usize, timeout: Duration) -> bool {
         if self.size().await < n {
-            // @TODO: Add race with the timeout
-            let mut ms = self.members.lock().await;
-            while ms.len() < n {
-                ms = self.view_changed.wait(ms).await;
-            }
+            let f1 = async {
+                let mut ms = self.members.lock().await;
+                while ms.len() < n {
+                    ms = self.view_changed.wait(ms).await;
+                }
+                true
+            };
+            let res: bool = select! {
+                _ = f1.fuse() => true,
+                _ = async_std::task::sleep(timeout).fuse() => false
+            };
+            res
+        } else {
+            true
         }
     }
 
