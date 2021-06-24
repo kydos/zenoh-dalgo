@@ -10,19 +10,15 @@ async fn main() {
     let z = Arc::new(open(ConfigProperties::default()).await.unwrap());
     let mut zgc = ZGroupConfig::new(z.id().await, "demo-group".to_string());
     zgc.lease(Duration::from_secs(2));
-
+    let n = 3; // @TODO: This should be a command line arg.
     let group = ZGroup::join(z.clone(), zgc).await;
-    let rx = group.subscribe().await;
-    let mut stream = rx.stream();
-    while let Some(evt) = stream.next().await {
-        println!(">>> {:?}", evt);
-        println!(">> Group View <<");
-        let v = group.view().await;
+    println!(">>> Waiting for a view of {} members to be established", n);
+    if group.await_view_size(n, Duration::from_secs(10)).await {
+        println!("Reached Group Size: {}", group.size().await);
+    } else {
         println!(
-            "{}",
-            v.iter()
-                .fold(String::from("\n"), |a, b| format!("\t{} \n\t{}", a, b)),
+            "Could not reach group size by allocated time, the group has only {} members",
+            group.size().await
         );
-        println!(">>>>>>><<<<<<<<<");
     }
 }

@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 use zenoh::net::queryable::EVAL;
 use zenoh::net::{ConsolidationMode, QueryConsolidation, QueryTarget, Sample, Session, SubInfo};
-use zenoh::ZFuture;
 
 const ZGROUP_PREFIX: &str = "/zenoh/net/utils/group";
 const MAX_START_LOOKOUT_DELAY: usize = 2;
@@ -32,25 +31,48 @@ pub enum ZGroupEvent {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Member {
+    mid: String,
+    info: Option<String>,
+    lease: Duration,
+}
+
+impl Member {
+    pub fn new(mid: &str) -> Member {
+        Member {
+            mid: String::from(mid),
+            info: None,
+            lease: DEFAULT_LEASE,
+        }
+    }
+    pub fn info(&mut self, i: &str) -> &mut Self {
+        self.info = Some(String::from(i));
+        self
+    }
+    pub fn lease(&mut self, d: Duration) -> &mut Self {
+        self.lease = d;
+        self
+    }
+}
+
 pub struct ZGroupConfig {
     gid: String,
     mid: String,
     lease: Duration,
     view_refresh_lease_ratio: f32,
     query_timeout: Duration,
-    z: Arc<Session>,
 }
 
 impl ZGroupConfig {
-    pub fn new(z: Arc<Session>, group_id: String) -> ZGroupConfig {
-        let mid = z.id().wait();
+    pub fn new(member_id: String, group_id: String) -> ZGroupConfig {
+        let mid = member_id;
         ZGroupConfig {
             gid: group_id,
             mid,
             lease: DEFAULT_LEASE,
             view_refresh_lease_ratio: VIEW_REFRESH_LEASE_RATIO,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
-            z,
         }
     }
     pub fn member_id(&mut self, id: String) -> &mut Self {
@@ -67,11 +89,11 @@ impl ZGroupConfig {
         self.view_refresh_lease_ratio = r;
         self
     }
-    pub fn query_timeout(&mut self, d: Duration) {
+    pub fn query_timeout(&mut self, d: Duration) -> &mut Self {
         self.query_timeout = d;
+        self
     }
 }
-
 pub struct ZGroup {
     gid: String,
     mid: String,
@@ -270,6 +292,7 @@ async fn refresh_view(
     self_id: String,
     evt_res_id: u64,
     lease: Duration,
+    query_timeout: Duration,
     tx: Arc<Sender<ZGroupEvent>>,
     leader: Arc<Mutex<String>>,
 ) {
@@ -294,11 +317,18 @@ async fn refresh_view(
                 .query(&query.clone().into(), &self_id, QueryTarget::default(), qc)
                 .await;
             let mut members = HashSet::new();
-            if let Ok(mut new_view) = reply {
-                while let Some(m) = new_view.next().await {
-                    members.insert(String::from_utf8(m.data.payload.get_vec()).unwrap());
+            let f = async {
+                if let Ok(mut new_view) = reply {
+                    while let Some(m) = new_view.next().await {
+                        members.insert(String::from_utf8(m.data.payload.get_vec()).unwrap());
+                    }
                 }
-            }
+            };
+            select! {
+                _ = f.fuse() => (),
+                _ = async_std::task::sleep(query_timeout).fuse() => ()
+            };
+
             let uge = ZGroupEvent::UpdatedGroupView {
                 source: self_id.clone(),
                 members,
@@ -310,17 +340,14 @@ async fn refresh_view(
     }
 }
 impl ZGroup {
-    pub async fn join(config: ZGroupConfig) -> ZGroup {
+    /// Joins a new group using the provided configuration.
+    pub async fn join(z: Arc<Session>, config: ZGroupConfig) -> ZGroup {
         let leader = Arc::new(Mutex::new(config.mid.clone()));
         let members = Arc::new(Mutex::new(HashSet::new()));
         let qrbl_res = format!("/{}/{}/member/{}", ZGROUP_PREFIX, &config.gid, &config.mid);
         let query = format!("/{}/{}/member/*", ZGROUP_PREFIX, &config.gid);
         let evt_res = format!("/{}/{}/event", ZGROUP_PREFIX, &config.gid);
-        let evt_res_id = config
-            .z
-            .declare_resource(&evt_res.clone().into())
-            .await
-            .unwrap();
+        let evt_res_id = z.declare_resource(&evt_res.clone().into()).await.unwrap();
         let view_changed = Arc::new(Condvar::new());
 
         let (evt_tx, evt_rx) = flume::unbounded::<ZGroupEvent>();
@@ -349,7 +376,7 @@ impl ZGroup {
         log::debug!("Registering handler for Queriable");
         // Spawn task to handle queries
         async_std::task::spawn(query_handler(
-            config.z.clone(),
+            z.clone(),
             qrbl_res,
             config.mid.clone(),
             Arc::new(evt_tx.clone()),
@@ -370,8 +397,7 @@ impl ZGroup {
             last_router: ConsolidationMode::None,
             reception: ConsolidationMode::None,
         };
-        let mut initial_view = config
-            .z
+        let mut initial_view = z
             .query(
                 &query.clone().into(),
                 &config.mid,
@@ -397,17 +423,18 @@ impl ZGroup {
         // Now we start the task tha refreshes the view if we are the member with the
         // smallest group-id
         let rv = refresh_view(
-            config.z.clone(),
+            z.clone(),
             query.clone(),
             config.mid.clone(),
             evt_res_id,
             config.lease,
+            config.query_timeout,
             Arc::new(evt_tx.clone()),
             leader.clone(),
         );
         async_std::task::spawn(rv);
         let zeh = zenoh_event_handler(
-            config.z.clone(),
+            z.clone(),
             evt_res_id,
             config.lease,
             leader.clone(),
@@ -417,25 +444,32 @@ impl ZGroup {
         zg
     }
 
+    /// Returns the group identifier.
     pub fn group_id(&self) -> &str {
         &self.gid
     }
+
+    /// Returns this member identifier.
     pub fn member_id(&self) -> &str {
         &self.mid
     }
+    /// Returns the current group leader.
     pub async fn leader_id(&self) -> String {
         self.leader.lock().await.clone()
     }
+    /// Returns the current group view, in other terms the list
+    /// of group members.
     pub async fn view(&self) -> HashSet<String> {
         let ms = self.members.lock().await;
         ms.clone()
     }
-
+    /// Returns the current group size.
     pub async fn size(&self) -> usize {
         let ms = self.members.lock().await;
         ms.len()
     }
-
+    /// Waits for a view size to be established within a given time and if
+    /// the view is established it returns *true* and *false* otherwise.
     pub async fn await_view_size(&self, n: usize, timeout: Duration) -> bool {
         if self.size().await < n {
             let f1 = async {
@@ -454,7 +488,7 @@ impl ZGroup {
             true
         }
     }
-
+    // Returns the group lease duration.
     pub fn lease(&self) -> Duration {
         self.lease
     }
