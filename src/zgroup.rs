@@ -14,6 +14,7 @@ use zenoh::net::{
     CongestionControl, ConsolidationMode, QueryConsolidation, QueryTarget, Reliability, ResKey,
     Sample, Session, SubInfo, SubMode,
 };
+use zenoh_util::sync::Condition;
 
 const GROUP_PREFIX: &str = "/zenoh/ext/net/group";
 const EVENT_POSTFIX: &str = "evt";
@@ -117,6 +118,7 @@ struct GroupState {
     group_resource_id: u64,
     event_resource: ResKey,
     user_events_tx: Mutex<Option<Sender<GroupEvent>>>,
+    cond: Condition,
 }
 
 pub struct Group {
@@ -209,13 +211,11 @@ async fn advertise_view(z: &Arc<Session>, state: &Arc<GroupState>) {
         })
         .collect();
     members.push(state.local_member.clone());
-    println!("advertising_view: min_id = {}, sid = {}", &min, &sid);
     if min == String::from(sid) {
         let evt = GroupNetEvent::NewGroupView(NewGroupViewEvent {
             source: sid.clone(),
             members,
         });
-        println!("Advertising NewGroupView: {:?}", &evt);
         log::debug!("Advertising NewGroupView: {:?}", &evt);
         let buf = bincode::serialize(&evt).unwrap();
         let res = format!("{}/{}/{}", GROUP_PREFIX, &state.gid, EVENT_POSTFIX);
@@ -242,11 +242,10 @@ async fn net_event_handler(z: Arc<Session>, state: Arc<GroupState>) {
                     advertise_view(&z, &state).await;
                     log::debug!("Member joining the group:\n{:?}", &je.member);
                     let alive_till = Instant::now().add(je.member.lease.clone());
-                    state
-                        .members
-                        .lock()
-                        .await
-                        .insert(je.member.mid.clone(), (je.member.clone(), alive_till));
+                    let mut ms = state.members.lock().await;
+                    ms.insert(je.member.mid.clone(), (je.member.clone(), alive_till));
+                    state.cond.notify_all();
+                    drop(ms);
                     let u_evt = &*state.user_events_tx.lock().await;
                     if let Some(tx) = u_evt {
                         tx.send(GroupEvent::Join(je)).unwrap()
@@ -311,6 +310,7 @@ async fn net_event_handler(z: Arc<Session>, state: Arc<GroupState>) {
                                         }
                                     }
                                 }
+                                state.cond.notify_all();
                             }
                         }
                     } else {
@@ -350,6 +350,7 @@ impl Group {
             group_resource_id: rid,
             event_resource: event_resource.clone(),
             user_events_tx: Mutex::new(Default::default()),
+            cond: Condition::new(),
         });
         let is_auto_liveliness = match with.liveliness {
             MemberLiveliness::Auto => true,
@@ -415,9 +416,34 @@ impl Group {
         ms.push(self.state.local_member.clone());
         ms
     }
+
+    /// Wait for a view size to be established or times out. The resulting predicate
+    /// indicates whether the desired view size has been established.
+    pub async fn wait_for_view_size(&self, size: usize, timeout: Duration) -> bool {
+        if self.state.members.lock().await.len() + 1 >= size {
+            true
+        } else {
+            // let s = self.state.clone();
+            let f = async {
+                loop {
+                    let ms = self.state.members.lock().await;
+                    if ms.len() + 1 >= size {
+                        return true;
+                    } else {
+                        self.state.cond.wait(ms).await;
+                    }
+                }
+            };
+            let r: bool = select! {
+                p = f.fuse() => { p },
+                _ = async_std::task::sleep(timeout).fuse() => { false },
+            };
+            r
+        }
+    }
     /// Returns the current group size.
     pub async fn size(&self) -> usize {
         let ms = self.state.members.lock().await;
-        ms.len()
+        ms.len() + 1 // with +1 being the local member
     }
 }
